@@ -5,7 +5,7 @@ import threading
 import time
 import requests
 import json
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, Response, request, render_template_string, jsonify, stream_with_context
 import re
 
 app = Flask(__name__)
@@ -19,19 +19,19 @@ RTP_HOST = os.getenv("RTP_HOST", "127.0.0.1")
 RTP_PORT = str(os.getenv("RTP_PORT", "4444"))
 OUTPUT_FPS = str(os.getenv("OUTPUT_FPS", "60"))
 CHECK_INTERVAL_SECONDS = 60
-STREAM_PROCESS_VLC = None
-STREAM_PROCESS_FFMPEG = None
-CURRENT_VLC_PROCESS_ID = None
-CURRENT_FFMPEG_PROCESS_ID = None
+STREAM_PROCESS = None
+CURRENT_PROCESS_ID = None
 KILL_COUNTDOWN_MINUTES = 6
 CHANNELS = []
 FAVORITES = []
 FAVORITES_FILE = "/app/data/favorites.json"
-VLC_THREADS = os.getenv("VLC_THREADS", str(os.cpu_count()))  # Default to CPU core count
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", str(os.cpu_count()))  # Default to CPU core count
-VIDEO_CODEC = "mpeg4"  # Use MP4v for software encoding
+TARGET_WIDTH = 1280
+TARGET_HEIGHT = 720
+BITRATE = "5120k"
+CODEC = "h264_videotoolbox" if os.getenv("USE_VIDEOTOOLBOX", "true").lower() == "true" else "libx264"
 
-print(f"*** Using video codec: {VIDEO_CODEC} (VLC threads: {VLC_THREADS}, FFmpeg threads: {FFMPEG_THREADS})")
+print(f"*** Using video codec: {CODEC} (FFmpeg threads: {FFMPEG_THREADS}, FPS: {OUTPUT_FPS})")
 
 def load_favorites():
     """Load favorite channels from JSON file."""
@@ -102,251 +102,44 @@ HTML_TEMPLATE = """
     <title>Multi4Channels</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {
-            font-family: 'Arial', 'Helvetica', sans-serif;
-            background: #111;
-            color: white;
-            margin: 0;
-            overflow-x: hidden;
-        }
-        header {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 0.5em 1em;
-            background: #222;
-            position: fixed;
-            top: 0;
-            width: 100%;
-            z-index: 10;
-        }
-        h1 {
-            font-size: 1.8em;
-            margin: 0;
-            text-align: center;
-        }
-        .hamburger {
-            font-size: 1.8em;
-            cursor: pointer;
-            padding: 0.8em;
-            position: absolute;
-            right: 0.5em;
-            text-overflow: clip;
-            white-space: nowrap;
-            z-index: 11;
-        }
-        #menu {
-            position: fixed;
-            top: 0;
-            right: 0;
-            width: 70%;
-            max-width: 250px;
-            height: 100%;
-            background: #222;
-            transform: translateX(100%);
-            transition: transform 0.3s ease;
-            padding-top: 4em;
-            z-index: 9;
-        }
-        #menu.open {
-            transform: translateX(0);
-        }
-        #menu ul {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        #menu li {
-            padding: 1em 1.5em;
-            border-bottom: 1px solid #444;
-            font-size: 1.1em;
-            cursor: pointer;
-        }
-        #menu li:hover {
-            background: #333;
-        }
-        .container {
-            padding: 4.5em 1em 1em;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-        form {
-            text-align: center;
-        }
-        input[type=text] {
-            font-size: 1.5em;
-            width: 4.5em;
-            margin: 0.3em;
-            padding: 0.2em;
-            box-sizing: border-box;
-            border-radius: 4px;
-        }
-        .grid {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 0.3em;
-        }
-        .grid div {
-            width: 48%;
-            min-width: 100px;
-        }
-        input[type=submit] {
-            font-size: 1.1em;
-            padding: 0.6em 1.2em;
-            margin: 1em 0;
-            cursor: pointer;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-        }
-        input[type=submit]:hover {
-            background: #0056b3;
-        }
-        #favorites {
-            margin-top: 1.5em;
-            text-align: center;
-        }
-        #favorites h2 {
-            font-size: 1.3em;
-            margin: 0.5em 0;
-        }
-        #favorites ul {
-            list-style: none;
-            padding: 0;
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 0.5em;
-        }
-        #favorites li {
-            font-size: 0.95em;
-            padding: 0.6em;
-            background: #333;
-            margin: 0.3em;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        #favorites li:hover {
-            background: #444;
-        }
-        #channels-page {
-            display: none;
-            padding: 4.5em 1em 1em;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-        #channels-page h2 {
-            font-size: 1.3em;
-            margin: 0.5em 0;
-        }
-        #channels-page ul {
-            list-style: none;
-            padding: 0;
-        }
-        #channels-page li {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0.6em;
-            background: #333;
-            margin: 0.3em 0;
-            border-radius: 4px;
-            font-size: 0.95em;
-        }
-        .heart {
-            cursor: pointer;
-            font-size: 1.2em;
-            padding: 0.3em;
-        }
-        .heart.favorited {
-            color: red;
-        }
-        .button-group {
-            text-align: center;
-            margin-top: 1em;
-        }
-        .button-group button.save {
-            font-size: 1.1em;
-            padding: 0.6em 1.2em;
-            margin: 0.5em;
-            cursor: pointer;
-            background: #dc3545;
-            color: white;
-            border: none;
-            border-radius: 4px;
-        }
-        .button-group button.save:hover {
-            background: #c82333;
-        }
-        .button-group button.back {
-            font-size: 1.1em;
-            padding: 0.6em 1.2em;
-            margin: 0.5em;
-            cursor: pointer;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-        }
-        .button-group button.back:hover {
-            background: #0056b3;
-        }
-        #notification {
-            display: none;
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: #333;
-            padding: 1em 2em;
-            border-radius: 8px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.5);
-            z-index: 1000;
-            text-align: center;
-        }
-        #notification p {
-            font-size: 0.95em;
-            margin: 0 0 1em;
-        }
-        #notification button {
-            font-size: 1em;
-            padding: 0.5em 1em;
-            cursor: pointer;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-        }
-        #notification button:hover {
-            background: #0056b3;
-        }
-        @media (min-width: 600px) {
-            h1 {
-                font-size: 2.2em;
-            }
-            input[type=text] {
-                font-size: 1.8em;
-            }
-            input[type=submit] {
-                font-size: 1.2em;
-            }
-            #menu li {
-                font-size: 1.2em;
-            }
-            #favorites ul {
-                gap: 1em;
-            }
-        }
-        @media (max-width: 360px) {
-            .grid div {
-                width: 100%;
-            }
-            .hamburger {
-                padding: 0.5em;
-                right: 0.2em;
-            }
-        }
+        body { font-family: 'Arial', 'Helvetica', sans-serif; background: #111; color: white; margin: 0; overflow-x: hidden; }
+        header { display: flex; justify-content: center; align-items: center; padding: 0.5em 1em; background: #222; position: fixed; top: 0; width: 100%; z-index: 10; }
+        h1 { font-size: 1.8em; margin: 0; text-align: center; }
+        .hamburger { font-size: 1.8em; cursor: pointer; padding: 0.8em; position: absolute; right: 0.5em; z-index: 11; }
+        #menu { position: fixed; top: 0; right: 0; width: 70%; max-width: 250px; height: 100%; background: #222; transform: translateX(100%); transition: transform 0.3s ease; padding-top: 4em; z-index: 9; }
+        #menu.open { transform: translateX(0); }
+        #menu ul { list-style: none; padding: 0; margin: 0; }
+        #menu li { padding: 1em 1.5em; border-bottom: 1px solid #444; font-size: 1.1em; cursor: pointer; }
+        #menu li:hover { background: #333; }
+        .container { padding: 4.5em 1em 1em; max-width: 600px; margin: 0 auto; }
+        form { text-align: center; }
+        input[type=text] { font-size: 1.5em; width: 4.5em; margin: 0.3em; padding: 0.2em; box-sizing: border-box; border-radius: 4px; }
+        .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3em; }
+        .grid div { width: 48%; min-width: 100px; }
+        input[type=submit] { font-size: 1.1em; padding: 0.6em 1.2em; margin: 1em 0; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        input[type=submit]:hover { background: #0056b3; }
+        #favorites { margin-top: 1.5em; text-align: center; }
+        #favorites h2 { font-size: 1.3em; margin: 0.5em 0; }
+        #favorites ul { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5em; }
+        #favorites li { font-size: 0.95em; padding: 0.6em; background: #333; margin: 0.3em; border-radius: 4px; cursor: pointer; }
+        #favorites li:hover { background: #444; }
+        #channels-page { display: none; padding: 4.5em 1em 1em; max-width: 600px; margin: 0 auto; }
+        #channels-page h2 { font-size: 1.3em; margin: 0.5em 0; }
+        #channels-page ul { list-style: none; padding: 0; }
+        #channels-page li { display: flex; justify-content: space-between; align-items: center; padding: 0.6em; background: #333; margin: 0.3em 0; border-radius: 4px; font-size: 0.95em; }
+        .heart { cursor: pointer; font-size: 1.2em; padding: 0.3em; }
+        .heart.favorited { color: red; }
+        .button-group { text-align: center; margin-top: 1em; }
+        .button-group button.save { font-size: 1.1em; padding: 0.6em 1.2em; margin: 0.5em; cursor: pointer; background: #dc3545; color: white; border: none; border-radius: 4px; }
+        .button-group button.save:hover { background: #c82333; }
+        .button-group button.back { font-size: 1.1em; padding: 0.6em 1.2em; margin: 0.5em; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        .button-group button.back:hover { background: #0056b3; }
+        #notification { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #333; padding: 1em 2em; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.5); z-index: 1000; text-align: center; }
+        #notification p { font-size: 0.95em; margin: 0 0 1em; }
+        #notification button { font-size: 1em; padding: 0.5em 1em; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        #notification button:hover { background: #0056b3; }
+        @media (min-width: 600px) { h1 { font-size: 2.2em; } input[type=text] { font-size: 1.8em; } input[type=submit] { font-size: 1.2em; } #menu li { font-size: 1.2em; } #favorites ul { gap: 1em; } }
+        @media (max-width: 360px) { .grid div { width: 100%; } .hamburger { padding: 0.5em; right: 0.2em; } }
     </style>
 </head>
 <body>
@@ -541,7 +334,7 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start_stream():
-    global STREAM_PROCESS_VLC, STREAM_PROCESS_FFMPEG, CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
+    global STREAM_PROCESS, CURRENT_PROCESS_ID
 
     ch1 = request.form.get("ch1")
     ch2 = request.form.get("ch2")
@@ -551,112 +344,79 @@ def start_stream():
 
     print(f"*** Starting stream with channels: {', '.join(channels)}")
 
-    # Terminate existing processes
-    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS_VLC:
+    # Terminate existing process
+    if CURRENT_PROCESS_ID and STREAM_PROCESS:
         try:
-            print(f"*** Terminating VLC process PID {CURRENT_VLC_PROCESS_ID}")
-            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS_VLC.wait(timeout=5)
-            print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} terminated")
-        except ProcessLookupError:
-            print("*** Previous VLC process already terminated")
-        except subprocess.TimeoutExpired:
-            print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} did not terminate gracefully, forcing kill")
-            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS_VLC.wait(timeout=2)
-        except Exception as e:
-            print(f"*** Error terminating VLC process: {e}")
-        CURRENT_VLC_PROCESS_ID = None
-        STREAM_PROCESS_VLC = None
-
-    if CURRENT_FFMPEG_PROCESS_ID and STREAM_PROCESS_FFMPEG:
-        try:
-            print(f"*** Terminating FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
-            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS_FFMPEG.wait(timeout=5)
-            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} terminated")
+            print(f"*** Terminating FFmpeg process PID {CURRENT_PROCESS_ID}")
+            os.kill(CURRENT_PROCESS_ID, signal.SIGTERM)
+            STREAM_PROCESS.wait(timeout=5)
+            print(f"*** FFmpeg process PID {CURRENT_PROCESS_ID} terminated")
         except ProcessLookupError:
             print("*** Previous FFmpeg process already terminated")
         except subprocess.TimeoutExpired:
-            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} did not terminate gracefully, forcing kill")
-            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS_FFMPEG.wait(timeout=2)
+            print(f"*** FFmpeg process PID {CURRENT_PROCESS_ID} did not terminate gracefully, forcing kill")
+            os.kill(CURRENT_PROCESS_ID, signal.SIGKILL)
+            STREAM_PROCESS.wait(timeout=2)
         except Exception as e:
             print(f"*** Error terminating FFmpeg process: {e}")
-        CURRENT_FFMPEG_PROCESS_ID = None
-        STREAM_PROCESS_FFMPEG = None
+        CURRENT_PROCESS_ID = None
+        STREAM_PROCESS = None
         time.sleep(1)
 
-    # Create named pipe for VLC to FFmpeg
-    pipe_path = "/tmp/mosaicpipe"
-    try:
-        if os.path.exists(pipe_path):
-            os.remove(pipe_path)
-        os.mkfifo(pipe_path)
-        print(f"*** Created named pipe at {pipe_path}")
-    except Exception as e:
-        print(f"*** Error creating named pipe: {e}")
-        return "Failed to start stream", 500
+    # Build input URLs
+    urls = [f"http://{CDVR_HOST}:{CDVR_PORT}/devices/ANY/channels/{ch}/stream.mpg" for ch in channels]
+    num_inputs = len(urls)
 
-    # Write VLM configuration for VLC (mosaic only, raw output)
-    with open("/tmp/multi4.vlm", "w") as f:
-        f.write("del all\n\n")
-        for i, ch in enumerate(channels):
-            f.write(f"new ch{i+1} broadcast enabled\n")
-            f.write(f"setup ch{i+1} input http://{CDVR_HOST}:{CDVR_PORT}/devices/ANY/channels/{ch}/stream.mpg\n")
-            f.write(f"setup ch{i+1} option http-reconnect\n")
-            f.write(f"setup ch{i+1} option network-caching=1000\n")
-            if i == 1:
-                f.write(f"setup ch{i+1} output #duplicate{{dst=mosaic-bridge{{id=ch{i+1},width=960,height=540}},select=video,dst=bridge-out{{id=0}},select=audio}}\n\n")
-            else:
-                f.write(f"setup ch{i+1} output #mosaic-bridge{{id=ch{i+1},width=960,height=540}}\n\n")
-        f.write("new bg broadcast enabled\n")
-        f.write("setup bg input /app/photos/bg.jpg\n")
-        f.write("setup bg option image-duration=-1\n")
-        f.write("setup bg option image-fps=60/1\n")
-        f.write(
-            f'setup bg output #transcode{{vcodec=rawvideo,vb=0,fps={OUTPUT_FPS},acodec=none,channels=2,threads={VLC_THREADS},sfilter=mosaic{{alpha=255,width=1920,height=1080,cols=2,rows=2,position=1,order="ch1,ch2,ch3,ch4",keep-aspect-ratio=enabled,mosaic-align=0,keep-picture=1}}}}:bridge-in{{offset=100}}:standard{{access=file,mux=raw,dst={pipe_path}}}\n\n'
-        )
-        f.write("control bg play\n")
-        for i in range(len(channels)):
-            f.write(f"control ch{i+1} play\n")
+    # Build FFmpeg command
+    ffmpeg_cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+    for url in urls:
+        ffmpeg_cmd += ['-i', url]
 
-    # Start VLC process
-    try:
-        vlc_cmd = [
-            "cvlc", "--vlm-conf", "/tmp/multi4.vlm",
-            "--verbose", "1", "--file-logging", "--logfile", "/tmp/vlc.log",
-            "--network-caching=1000", "--sout-mux-caching=1000",
-            "--sout-transcode-threads", VLC_THREADS
-        ]
-        STREAM_PROCESS_VLC = subprocess.Popen(vlc_cmd)
-        CURRENT_VLC_PROCESS_ID = STREAM_PROCESS_VLC.pid
-        print(f"*** VLC started with PID {CURRENT_VLC_PROCESS_ID} for mosaic generation")
-    except Exception as e:
-        print(f"*** Error starting VLC process: {e}")
-        return "Failed to start stream", 500
+    # Build scaling filters and xstack layout
+    filter_parts = [f'[{i}:v]fps={OUTPUT_FPS},scale={TARGET_WIDTH}:{TARGET_HEIGHT}[v{i}]' for i in range(num_inputs)]
+    layout_map = {
+        1: "[v0]xstack=inputs=1:layout=0_0[v]",
+        2: "[v0][v1]xstack=inputs=2:layout=0_0|w0_0[v]",
+        3: "[v0][v1][v2]xstack=inputs=3:layout=0_0|w0_0|0_h0[v]",
+        4: "[v0][v1][v2][v3]xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[v]"
+    }
+    filter_parts.append(layout_map[num_inputs])
+    filter_complex = ';'.join(filter_parts)
+
+    ffmpeg_cmd += [
+        '-filter_complex', filter_complex,
+        '-map', '[v]'
+    ]
+
+    # Map all audio tracks individually
+    for i in range(num_inputs):
+        ffmpeg_cmd += ['-map', f'{i}:a']
+
+    # Encoding settings
+    ffmpeg_cmd += [
+        '-c:v', CODEC,
+        '-b:v', BITRATE,
+        '-c:a', 'copy',
+        '-threads', FFMPEG_THREADS,
+        '-f', 'rtp',
+        f'rtp://{RTP_HOST}:{RTP_PORT}?mux=ts&sap&name=Multi4&ttl=10'
+    ]
 
     # Start FFmpeg process
     try:
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-i", pipe_path,
-            "-c:v", VIDEO_CODEC,
-            "-b:v", "0",
-            "-r", OUTPUT_FPS,
-            "-c:a", "none",
-            "-threads", FFMPEG_THREADS,
-            "-f", "rtp",
-            f"rtp://{RTP_HOST}:{RTP_PORT}?mux=ts&sap&name=Multi4&ttl=10"
-        ]
-        STREAM_PROCESS_FFMPEG = subprocess.Popen(ffmpeg_cmd)
-        CURRENT_FFMPEG_PROCESS_ID = STREAM_PROCESS_FFMPEG.pid
-        print(f"*** FFmpeg started with PID {CURRENT_FFMPEG_PROCESS_ID} for encoding and RTP streaming")
+        STREAM_PROCESS = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, text=True)
+        CURRENT_PROCESS_ID = STREAM_PROCESS.pid
+        print(f"*** FFmpeg started with PID {CURRENT_PROCESS_ID} for mosaic and RTP streaming")
     except Exception as e:
         print(f"*** Error starting FFmpeg process: {e}")
-        if CURRENT_VLC_PROCESS_ID:
-            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
         return "Failed to start stream", 500
+
+    # Monitor FFmpeg stderr for errors
+    def log_stderr(process, name):
+        for line in iter(process.stderr.readline, ''):
+            print(f"*** {name} stderr: {line.strip()}")
+
+    threading.Thread(target=log_stderr, args=(STREAM_PROCESS, "FFmpeg"), daemon=True).start()
 
     if CDVR_CHNLNUM:
         threading.Thread(target=watch_for_quit, daemon=True).start()
@@ -665,50 +425,24 @@ def start_stream():
 
 @app.route("/stop", methods=["POST"])
 def stop_stream():
-    global STREAM_PROCESS_VLC, STREAM_PROCESS_FFMPEG, CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
+    global STREAM_PROCESS, CURRENT_PROCESS_ID
 
-    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS_VLC:
+    if CURRENT_PROCESS_ID and STREAM_PROCESS:
         try:
-            print(f"*** Stopping VLC process PID {CURRENT_VLC_PROCESS_ID}")
-            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS_VLC.wait(timeout=5)
-            print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} stopped")
-        except ProcessLookupError:
-            print("*** VLC process already stopped")
-        except subprocess.TimeoutExpired:
-            print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} did not stop gracefully, forcing kill")
-            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS_VLC.wait(timeout=2)
-        except Exception as e:
-            print(f"*** Error stopping VLC process: {e}")
-        CURRENT_VLC_PROCESS_ID = None
-        STREAM_PROCESS_VLC = None
-
-    if CURRENT_FFMPEG_PROCESS_ID and STREAM_PROCESS_FFMPEG:
-        try:
-            print(f"*** Stopping FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
-            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS_FFMPEG.wait(timeout=5)
-            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} stopped")
+            print(f"*** Stopping FFmpeg process PID {CURRENT_PROCESS_ID}")
+            os.kill(CURRENT_PROCESS_ID, signal.SIGTERM)
+            STREAM_PROCESS.wait(timeout=5)
+            print(f"*** FFmpeg process PID {CURRENT_PROCESS_ID} stopped")
         except ProcessLookupError:
             print("*** FFmpeg process already stopped")
         except subprocess.TimeoutExpired:
-            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} did not stop gracefully, forcing kill")
-            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS_FFMPEG.wait(timeout=2)
+            print(f"*** FFmpeg process PID {CURRENT_PROCESS_ID} did not stop gracefully, forcing kill")
+            os.kill(CURRENT_PROCESS_ID, signal.SIGKILL)
+            STREAM_PROCESS.wait(timeout=2)
         except Exception as e:
             print(f"*** Error stopping FFmpeg process: {e}")
-        CURRENT_FFMPEG_PROCESS_ID = None
-        STREAM_PROCESS_FFMPEG = None
-
-    # Clean up named pipe
-    pipe_path = "/tmp/mosaicpipe"
-    if os.path.exists(pipe_path):
-        try:
-            os.remove(pipe_path)
-            print(f"*** Removed named pipe {pipe_path}")
-        except Exception as e:
-            print(f"*** Error removing named pipe: {e}")
+        CURRENT_PROCESS_ID = None
+        STREAM_PROCESS = None
 
     return jsonify({"message": "Stream closed successfully"})
 
@@ -739,7 +473,7 @@ def save_favorites_endpoint():
     return jsonify({"message": "Favorites saved successfully"})
 
 def watch_for_quit():
-    global CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
+    global CURRENT_PROCESS_ID, STREAM_PROCESS
     inactive_minutes = 0
     print(f"*** Monitoring activity on channel {CDVR_CHNLNUM}")
 
@@ -754,27 +488,14 @@ def watch_for_quit():
                     inactive_minutes += 1
                     print(f"*** Channel no longer being watched. Countdown to kill: {inactive_minutes} / {KILL_COUNTDOWN_MINUTES} min")
                     if inactive_minutes >= KILL_COUNTDOWN_MINUTES:
-                        if CURRENT_VLC_PROCESS_ID:
+                        if CURRENT_PROCESS_ID:
                             try:
-                                os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
-                                print(f"*** Killed VLC process PID {CURRENT_VLC_PROCESS_ID}")
-                            except Exception as e:
-                                print(f"*** Error killing VLC: {e}")
-                            CURRENT_VLC_PROCESS_ID = None
-                        if CURRENT_FFMPEG_PROCESS_ID:
-                            try:
-                                os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
-                                print(f"*** Killed FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
+                                os.kill(CURRENT_PROCESS_ID, signal.SIGKILL)
+                                print(f"*** Killed FFmpeg process PID {CURRENT_PROCESS_ID}")
                             except Exception as e:
                                 print(f"*** Error killing FFmpeg: {e}")
-                            CURRENT_FFMPEG_PROCESS_ID = None
-                        pipe_path = "/tmp/mosaicpipe"
-                        if os.path.exists(pipe_path):
-                            try:
-                                os.remove(pipe_path)
-                                print(f"*** Removed named pipe {pipe_path}")
-                            except Exception as e:
-                                print(f"*** Error removing named pipe: {e}")
+                            CURRENT_PROCESS_ID = None
+                            STREAM_PROCESS = None
                         return
         except Exception as e:
             print(f"*** Error checking DVR activity: {e}")
