@@ -25,6 +25,7 @@ KILL_COUNTDOWN_MINUTES = 6
 CHANNELS = []
 FAVORITES = []
 FAVORITES_FILE = "/app/data/favorites.json"
+VLC_THREADS = os.getenv("VLC_THREADS", str(os.cpu_count()))  # Default to number of CPU cores
 
 def load_favorites():
     """Load favorite channels from JSON file."""
@@ -88,28 +89,23 @@ def scrape_m3u():
 
 scrape_m3u()
 
-def detect_qsv():
-    """Detect if Intel QuickSync Video (QSV) is available."""
+def detect_apple_hardware_encoding():
+    """Check if VLC supports VideoToolbox for H.264 encoding."""
     try:
-        if not os.path.exists("/dev/dri"):
-            print("*** No /dev/dri found, QSV unavailable")
-            return False
-        result = subprocess.run(["which", "vainfo"], capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            print("*** vainfo not found, QSV unavailable")
-            return False
-        result = subprocess.run(["vainfo"], capture_output=True, text=True, check=False)
-        if result.returncode == 0 and "VAEntrypointEncSlice" in result.stdout and "H.264" in result.stdout:
-            print("*** Intel QuickSync H.264 encoding detected")
+        result = subprocess.run(["cvlc", "--avcodec-hw", "videotoolbox", "--version"], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and "videotoolbox" in result.stdout.lower():
+            print("*** Apple VideoToolbox H.264 hardware encoding detected")
             return True
-        print("*** vainfo failed or no QSV H.264 support")
+        print("*** No Apple VideoToolbox support detected, falling back to software encoding")
         return False
     except Exception as e:
-        print(f"*** Error detecting QSV: {e}")
+        print(f"*** Error detecting Apple VideoToolbox: {e}")
         return False
 
-VIDEO_CODEC = "h264_vaapi" if detect_qsv() else "mp4v"
-print(f"*** Using video codec: {VIDEO_CODEC}")
+# Set codec based on hardware encoding availability
+VIDEO_CODEC = "h264" if detect_apple_hardware_encoding() else "mpeg4"
+print(f"*** Using video codec: {VIDEO_CODEC} (transcoding threads: {VLC_THREADS})")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -597,23 +593,27 @@ def start_stream():
             else:
                 f.write(f"setup ch{i+1} output #mosaic-bridge{{id=ch{i+1},width=960,height=540}}\n\n")
 
-        f.write("new bg broadcast enabled\n")
+       burgo        f.write("new bg broadcast enabled\n")
         f.write("setup bg input /app/photos/bg.jpg\n")
         f.write("setup bg option image-duration=-1\n")
         f.write("setup bg option image-fps=60/1\n")
         f.write(
-            f'setup bg output #transcode{{vcodec={VIDEO_CODEC},vb=0,fps={OUTPUT_FPS},acodec=none,channels=2,sfilter=mosaic{{alpha=255,width=1920,height=1080,cols=2,rows=2,position=1,order="ch1,ch2,ch3,ch4",keep-aspect-ratio=enabled,mosaic-align=0,keep-picture=1}}}}:bridge-in{{offset=100}}:rtp{{dst={RTP_HOST},port={RTP_PORT},mux=ts,sap,name=Multi4,ttl=10}}\n\n'
+            f'setup bg output #transcode{{vcodec={VIDEO_CODEC},vb=0,fps={OUTPUT_FPS},acodec=none,channels=2,threads={VLC_THREADS},sfilter=mosaic{{alpha=255,width=1920,height=1080,cols=2,rows=2,position=1,order="ch1,ch2,ch3,ch4",keep-aspect-ratio=enabled,mosaic-align=0,keep-picture=1}}}}:bridge-in{{offset=100}}:rtp{{dst={RTP_HOST},port={RTP_PORT},mux=ts,sap,name=Multi4,ttl=10}}\n\n'
         )
         f.write("control bg play\n")
         for i in range(len(channels)):
             f.write(f"control ch{i+1} play\n")
 
     try:
-        STREAM_PROCESS = subprocess.Popen([
+        cmd = [
             "cvlc", "--vlm-conf", "/tmp/multi4.vlm",
             "--verbose", "1", "--file-logging", "--logfile", "/tmp/vlc.log",
-            "--network-caching=1000", "--sout-mux-caching=1000"
-        ])
+            "--network-caching=1000", "--sout-mux-caching=1000",
+            "--sout-transcode-threads", VLC_THREADS
+        ]
+        if VIDEO_CODEC == "h264":
+            cmd.extend(["--avcodec-hw", "videotoolbox"])
+        STREAM_PROCESS = subprocess.Popen(cmd)
         CURRENT_VLC_PROCESS_ID = STREAM_PROCESS.pid
         print(f"*** VLC started with PID {CURRENT_VLC_PROCESS_ID}")
     except Exception as e:

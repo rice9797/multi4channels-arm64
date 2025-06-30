@@ -23,12 +23,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir flask requests
 
 COPY app /app
-#COPY photos/bg.jpg /app/photos/bg.jpg
 COPY start.sh /start.sh
 
 RUN chmod +x /start.sh && \
     chown -R vlcuser:vlcuser /app && \
     chmod -R u+w /app
+
+# Add label for GitHub Container Registry
+LABEL org.opencontainers.image.source=https://github.com/rice9797/multi4channels-arm64
 
 USER vlcuser
 CMD ["/start.sh"]
