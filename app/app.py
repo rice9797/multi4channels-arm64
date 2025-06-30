@@ -19,13 +19,19 @@ RTP_HOST = os.getenv("RTP_HOST", "127.0.0.1")
 RTP_PORT = str(os.getenv("RTP_PORT", "4444"))
 OUTPUT_FPS = str(os.getenv("OUTPUT_FPS", "60"))
 CHECK_INTERVAL_SECONDS = 60
-STREAM_PROCESS = None
+STREAM_PROCESS_VLC = None
+STREAM_PROCESS_FFMPEG = None
 CURRENT_VLC_PROCESS_ID = None
+CURRENT_FFMPEG_PROCESS_ID = None
 KILL_COUNTDOWN_MINUTES = 6
 CHANNELS = []
 FAVORITES = []
 FAVORITES_FILE = "/app/data/favorites.json"
-VLC_THREADS = os.getenv("VLC_THREADS", str(os.cpu_count()))  # Default to number of CPU cores
+VLC_THREADS = os.getenv("VLC_THREADS", str(os.cpu_count()))  # Default to CPU core count
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", str(os.cpu_count()))  # Default to CPU core count
+VIDEO_CODEC = "mpeg4"  # Use MP4v for software encoding
+
+print(f"*** Using video codec: {VIDEO_CODEC} (VLC threads: {VLC_THREADS}, FFmpeg threads: {FFMPEG_THREADS})")
 
 def load_favorites():
     """Load favorite channels from JSON file."""
@@ -88,24 +94,6 @@ def scrape_m3u():
         print(f"*** Error scraping M3U: {e}")
 
 scrape_m3u()
-
-def detect_apple_hardware_encoding():
-    """Check if VLC supports VideoToolbox for H.264 encoding."""
-    try:
-        result = subprocess.run(["cvlc", "--avcodec-hw", "videotoolbox", "--version"], 
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0 and "videotoolbox" in result.stdout.lower():
-            print("*** Apple VideoToolbox H.264 hardware encoding detected")
-            return True
-        print("*** No Apple VideoToolbox support detected, falling back to software encoding")
-        return False
-    except Exception as e:
-        print(f"*** Error detecting Apple VideoToolbox: {e}")
-        return False
-
-# Set codec based on hardware encoding availability
-VIDEO_CODEC = "h264" if detect_apple_hardware_encoding() else "mpeg4"
-print(f"*** Using video codec: {VIDEO_CODEC} (transcoding threads: {VLC_THREADS})")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -553,7 +541,7 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start_stream():
-    global STREAM_PROCESS, CURRENT_VLC_PROCESS_ID
+    global STREAM_PROCESS_VLC, STREAM_PROCESS_FFMPEG, CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
 
     ch1 = request.form.get("ch1")
     ch2 = request.form.get("ch2")
@@ -563,24 +551,54 @@ def start_stream():
 
     print(f"*** Starting stream with channels: {', '.join(channels)}")
 
-    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS:
+    # Terminate existing processes
+    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS_VLC:
         try:
             print(f"*** Terminating VLC process PID {CURRENT_VLC_PROCESS_ID}")
             os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS.wait(timeout=5)
+            STREAM_PROCESS_VLC.wait(timeout=5)
             print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} terminated")
         except ProcessLookupError:
             print("*** Previous VLC process already terminated")
         except subprocess.TimeoutExpired:
             print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} did not terminate gracefully, forcing kill")
             os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS.wait(timeout=2)
+            STREAM_PROCESS_VLC.wait(timeout=2)
         except Exception as e:
             print(f"*** Error terminating VLC process: {e}")
         CURRENT_VLC_PROCESS_ID = None
-        STREAM_PROCESS = None
+        STREAM_PROCESS_VLC = None
+
+    if CURRENT_FFMPEG_PROCESS_ID and STREAM_PROCESS_FFMPEG:
+        try:
+            print(f"*** Terminating FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
+            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGTERM)
+            STREAM_PROCESS_FFMPEG.wait(timeout=5)
+            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} terminated")
+        except ProcessLookupError:
+            print("*** Previous FFmpeg process already terminated")
+        except subprocess.TimeoutExpired:
+            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} did not terminate gracefully, forcing kill")
+            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
+            STREAM_PROCESS_FFMPEG.wait(timeout=2)
+        except Exception as e:
+            print(f"*** Error terminating FFmpeg process: {e}")
+        CURRENT_FFMPEG_PROCESS_ID = None
+        STREAM_PROCESS_FFMPEG = None
         time.sleep(1)
 
+    # Create named pipe for VLC to FFmpeg
+    pipe_path = "/tmp/mosaicpipe"
+    try:
+        if os.path.exists(pipe_path):
+            os.remove(pipe_path)
+        os.mkfifo(pipe_path)
+        print(f"*** Created named pipe at {pipe_path}")
+    except Exception as e:
+        print(f"*** Error creating named pipe: {e}")
+        return "Failed to start stream", 500
+
+    # Write VLM configuration for VLC (mosaic only, raw output)
     with open("/tmp/multi4.vlm", "w") as f:
         f.write("del all\n\n")
         for i, ch in enumerate(channels):
@@ -597,26 +615,47 @@ def start_stream():
         f.write("setup bg option image-duration=-1\n")
         f.write("setup bg option image-fps=60/1\n")
         f.write(
-            f'setup bg output #transcode{{vcodec={VIDEO_CODEC},vb=0,fps={OUTPUT_FPS},acodec=none,channels=2,threads={VLC_THREADS},sfilter=mosaic{{alpha=255,width=1920,height=1080,cols=2,rows=2,position=1,order="ch1,ch2,ch3,ch4",keep-aspect-ratio=enabled,mosaic-align=0,keep-picture=1}}}}:bridge-in{{offset=100}}:rtp{{dst={RTP_HOST},port={RTP_PORT},mux=ts,sap,name=Multi4,ttl=10}}\n\n'
+            f'setup bg output #transcode{{vcodec=rawvideo,vb=0,fps={OUTPUT_FPS},acodec=none,channels=2,threads={VLC_THREADS},sfilter=mosaic{{alpha=255,width=1920,height=1080,cols=2,rows=2,position=1,order="ch1,ch2,ch3,ch4",keep-aspect-ratio=enabled,mosaic-align=0,keep-picture=1}}}}:bridge-in{{offset=100}}:standard{{access=file,mux=raw,dst={pipe_path}}}\n\n'
         )
         f.write("control bg play\n")
         for i in range(len(channels)):
             f.write(f"control ch{i+1} play\n")
 
+    # Start VLC process
     try:
-        cmd = [
+        vlc_cmd = [
             "cvlc", "--vlm-conf", "/tmp/multi4.vlm",
             "--verbose", "1", "--file-logging", "--logfile", "/tmp/vlc.log",
             "--network-caching=1000", "--sout-mux-caching=1000",
             "--sout-transcode-threads", VLC_THREADS
         ]
-        if VIDEO_CODEC == "h264":
-            cmd.extend(["--avcodec-hw", "videotoolbox"])
-        STREAM_PROCESS = subprocess.Popen(cmd)
-        CURRENT_VLC_PROCESS_ID = STREAM_PROCESS.pid
-        print(f"*** VLC started with PID {CURRENT_VLC_PROCESS_ID}")
+        STREAM_PROCESS_VLC = subprocess.Popen(vlc_cmd)
+        CURRENT_VLC_PROCESS_ID = STREAM_PROCESS_VLC.pid
+        print(f"*** VLC started with PID {CURRENT_VLC_PROCESS_ID} for mosaic generation")
     except Exception as e:
         print(f"*** Error starting VLC process: {e}")
+        return "Failed to start stream", 500
+
+    # Start FFmpeg process
+    try:
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-i", pipe_path,
+            "-c:v", VIDEO_CODEC,
+            "-b:v", "0",
+            "-r", OUTPUT_FPS,
+            "-c:a", "none",
+            "-threads", FFMPEG_THREADS,
+            "-f", "rtp",
+            f"rtp://{RTP_HOST}:{RTP_PORT}?mux=ts&sap&name=Multi4&ttl=10"
+        ]
+        STREAM_PROCESS_FFMPEG = subprocess.Popen(ffmpeg_cmd)
+        CURRENT_FFMPEG_PROCESS_ID = STREAM_PROCESS_FFMPEG.pid
+        print(f"*** FFmpeg started with PID {CURRENT_FFMPEG_PROCESS_ID} for encoding and RTP streaming")
+    except Exception as e:
+        print(f"*** Error starting FFmpeg process: {e}")
+        if CURRENT_VLC_PROCESS_ID:
+            os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
         return "Failed to start stream", 500
 
     if CDVR_CHNLNUM:
@@ -626,27 +665,52 @@ def start_stream():
 
 @app.route("/stop", methods=["POST"])
 def stop_stream():
-    global STREAM_PROCESS, CURRENT_VLC_PROCESS_ID
+    global STREAM_PROCESS_VLC, STREAM_PROCESS_FFMPEG, CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
 
-    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS:
+    if CURRENT_VLC_PROCESS_ID and STREAM_PROCESS_VLC:
         try:
             print(f"*** Stopping VLC process PID {CURRENT_VLC_PROCESS_ID}")
             os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGTERM)
-            STREAM_PROCESS.wait(timeout=5)
+            STREAM_PROCESS_VLC.wait(timeout=5)
             print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} stopped")
         except ProcessLookupError:
             print("*** VLC process already stopped")
         except subprocess.TimeoutExpired:
             print(f"*** VLC process PID {CURRENT_VLC_PROCESS_ID} did not stop gracefully, forcing kill")
             os.kill(CURRENT_VLC_PROCESS_ID, signal.SIGKILL)
-            STREAM_PROCESS.wait(timeout=2)
+            STREAM_PROCESS_VLC.wait(timeout=2)
         except Exception as e:
             print(f"*** Error stopping VLC process: {e}")
         CURRENT_VLC_PROCESS_ID = None
-        STREAM_PROCESS = None
-        return jsonify({"message": "Stream closed successfully"})
-    else:
-        return jsonify({"message": "No stream is running"})
+        STREAM_PROCESS_VLC = None
+
+    if CURRENT_FFMPEG_PROCESS_ID and STREAM_PROCESS_FFMPEG:
+        try:
+            print(f"*** Stopping FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
+            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGTERM)
+            STREAM_PROCESS_FFMPEG.wait(timeout=5)
+            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} stopped")
+        except ProcessLookupError:
+            print("*** FFmpeg process already stopped")
+        except subprocess.TimeoutExpired:
+            print(f"*** FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID} did not stop gracefully, forcing kill")
+            os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
+            STREAM_PROCESS_FFMPEG.wait(timeout=2)
+        except Exception as e:
+            print(f"*** Error stopping FFmpeg process: {e}")
+        CURRENT_FFMPEG_PROCESS_ID = None
+        STREAM_PROCESS_FFMPEG = None
+
+    # Clean up named pipe
+    pipe_path = "/tmp/mosaicpipe"
+    if os.path.exists(pipe_path):
+        try:
+            os.remove(pipe_path)
+            print(f"*** Removed named pipe {pipe_path}")
+        except Exception as e:
+            print(f"*** Error removing named pipe: {e}")
+
+    return jsonify({"message": "Stream closed successfully"})
 
 @app.route("/reload_m3u")
 def reload_m3u():
@@ -675,7 +739,7 @@ def save_favorites_endpoint():
     return jsonify({"message": "Favorites saved successfully"})
 
 def watch_for_quit():
-    global CURRENT_VLC_PROCESS_ID
+    global CURRENT_VLC_PROCESS_ID, CURRENT_FFMPEG_PROCESS_ID
     inactive_minutes = 0
     print(f"*** Monitoring activity on channel {CDVR_CHNLNUM}")
 
@@ -697,6 +761,20 @@ def watch_for_quit():
                             except Exception as e:
                                 print(f"*** Error killing VLC: {e}")
                             CURRENT_VLC_PROCESS_ID = None
+                        if CURRENT_FFMPEG_PROCESS_ID:
+                            try:
+                                os.kill(CURRENT_FFMPEG_PROCESS_ID, signal.SIGKILL)
+                                print(f"*** Killed FFmpeg process PID {CURRENT_FFMPEG_PROCESS_ID}")
+                            except Exception as e:
+                                print(f"*** Error killing FFmpeg: {e}")
+                            CURRENT_FFMPEG_PROCESS_ID = None
+                        pipe_path = "/tmp/mosaicpipe"
+                        if os.path.exists(pipe_path):
+                            try:
+                                os.remove(pipe_path)
+                                print(f"*** Removed named pipe {pipe_path}")
+                            except Exception as e:
+                                print(f"*** Error removing named pipe: {e}")
                         return
         except Exception as e:
             print(f"*** Error checking DVR activity: {e}")

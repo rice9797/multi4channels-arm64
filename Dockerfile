@@ -1,36 +1,15 @@
-FROM debian:bookworm-slim
+# multi4channels-arm64
+ARM64 version of Multi4Channels, a Flask-based app for streaming multiple channels using VLC and FFmpeg.
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+## Setup
+1. Clone the repository: `git clone https://github.com/rice9797/multi4channels-arm64.git`
+2. Build the Docker image: `docker buildx build --platform linux/arm64 -t ghcr.io/rice9797/multi4channels-arm64:latest --push .`
+3. Or pull from GitHub Container Registry: `docker pull ghcr.io/rice9797/multi4channels-arm64:latest`
+4. Run: `docker run --platform linux/arm64 -p 9799:9799 -e VLC_THREADS=4 -e FFMPEG_THREADS=4 ghcr.io/rice9797/multi4channels-arm64:latest`
+   - Use `VLC_THREADS` to set CPU cores for VLC mosaic processing (default: auto-detected core count).
+   - Use `FFMPEG_THREADS` to set CPU cores for FFmpeg encoding (default: auto-detected core count).
 
-# Clear default sources and set custom sources.list with US mirror
-RUN rm -f /etc/apt/sources.list.d/* && \
-    echo "deb http://ftp.us.debian.org/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list && \
-    echo "deb http://ftp.us.debian.org/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
-    echo "deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
-    cat /etc/apt/sources.list
-
-# Update and install packages
-RUN apt-get update && apt-get install -y \
-    python3 python3-venv python3-pip vlc curl nano \
-    --no-install-recommends && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -m vlcuser
-
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir flask requests
-
-COPY app /app
-COPY start.sh /start.sh
-
-RUN chmod +x /start.sh && \
-    chown -R vlcuser:vlcuser /app && \
-    chmod -R u+w /app
-
-# Add label for GitHub Container Registry
-LABEL org.opencontainers.image.source=https://github.com/rice9797/multi4channels-arm64
-
-USER vlcuser
-CMD ["/start.sh"]
+## Notes
+- VLC creates the mosaic and outputs raw video; FFmpeg handles encoding (MP4v) and RTP streaming.
+- Logs show VLC and FFmpeg thread counts and process status.
+- Optimized for ARM64 (e.g., Apple M1/M2) with software encoding due to lack of GPU access in Docker on macOS.
