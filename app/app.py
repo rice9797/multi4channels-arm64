@@ -592,8 +592,7 @@ def start_stream():
                 f.write(f"setup ch{i+1} output #duplicate{{dst=mosaic-bridge{{id=ch{i+1},width=960,height=540}},select=video,dst=bridge-out{{id=0}},select=audio}}\n\n")
             else:
                 f.write(f"setup ch{i+1} output #mosaic-bridge{{id=ch{i+1},width=960,height=540}}\n\n")
-
-       burgo        f.write("new bg broadcast enabled\n")
+        f.write("new bg broadcast enabled\n")
         f.write("setup bg input /app/photos/bg.jpg\n")
         f.write("setup bg option image-duration=-1\n")
         f.write("setup bg option image-fps=60/1\n")
